@@ -108,11 +108,21 @@ def set_fact_lifecycle_zone(
 
 
 def reconcile_profile_lifecycle(db: Any, profile_id: str) -> int:
-    """Repair historical mirror drift using retention state as authority.
+    """Bring ``fact_retention.lifecycle_zone`` into line with the mirror.
 
-    Legacy archived atomic facts without a retention row are first imported as
-    ``archive`` so they remain excluded from ordinary recall.  Existing
-    retention rows then overwrite the compatibility mirror in one transaction.
+    ONE DIRECTION, deliberately. This used to sync both ways in a single
+    transaction -- the atomic mirror seeded the zone for any fact without a
+    retention row, and the zone then overwrote the mirror for every fact that
+    had one. With the maintenance pass writing ``lifecycle`` on its own
+    schedule, the two columns chased each other. Observed on a live store 39
+    minutes apart with no user activity: 3,963 rows disagreeing, then 0. Every
+    subsystem filtering ``lifecycle = 'active'`` got a different answer
+    depending on when it asked. GitHub #136.
+
+    The Langevin position is the only state here with a physical meaning. It
+    decides ``lifecycle``; ``lifecycle_zone`` is a view of that. Returns the
+    number of rows that disagreed before this pass, so a caller can see drift
+    rather than infer it.
     """
     transaction = getattr(db, "transaction", None)
     txn_state = getattr(db, "_txn_state", None)
@@ -123,31 +133,25 @@ def reconcile_profile_lifecycle(db: Any, profile_id: str) -> int:
         else nullcontext()
     )
     with context:
+        rows = _materialize_rows(db.execute(
+            "SELECT COUNT(*) AS count FROM atomic_facts af "
+            "LEFT JOIN fact_retention fr ON fr.fact_id = af.fact_id "
+            "WHERE af.profile_id = ? AND (fr.fact_id IS NULL OR fr.lifecycle_zone != "
+            "CASE WHEN af.lifecycle = 'archived' THEN 'archive' "
+            "ELSE af.lifecycle END)",
+            (profile_id,),
+        ))
+        changed = int(rows[0]["count"]) if rows else 0
+        # Only lifecycle_zone is a mirror. retention_score and
+        # last_accessed_at are measured elsewhere and must survive this.
         db.execute(
             "INSERT INTO fact_retention (fact_id, profile_id, lifecycle_zone) "
             "SELECT fact_id, profile_id, "
             "CASE WHEN lifecycle = 'archived' THEN 'archive' ELSE lifecycle END "
-            "FROM atomic_facts af WHERE profile_id = ? AND lifecycle != 'active' "
-            "AND NOT EXISTS (SELECT 1 FROM fact_retention fr "
-            "WHERE fr.fact_id = af.fact_id)",
-            (profile_id,),
-        )
-        rows = _materialize_rows(db.execute(
-            "SELECT COUNT(*) AS count FROM atomic_facts af "
-            "JOIN fact_retention fr ON fr.fact_id = af.fact_id "
-            "WHERE af.profile_id = ? AND af.lifecycle != "
-            "CASE WHEN fr.lifecycle_zone IN ('archive', 'forgotten') "
-            "THEN 'archived' ELSE fr.lifecycle_zone END",
-            (profile_id,),
-        ))
-        changed = int(rows[0]["count"]) if rows else 0
-        db.execute(
-            "UPDATE atomic_facts SET lifecycle = ("
-            "SELECT CASE WHEN fr.lifecycle_zone IN ('archive', 'forgotten') "
-            "THEN 'archived' ELSE fr.lifecycle_zone END "
-            "FROM fact_retention fr WHERE fr.fact_id = atomic_facts.fact_id) "
-            "WHERE profile_id = ? AND EXISTS ("
-            "SELECT 1 FROM fact_retention fr WHERE fr.fact_id = atomic_facts.fact_id)",
+            "FROM atomic_facts WHERE profile_id = ? "
+            "ON CONFLICT(fact_id) DO UPDATE SET "
+            "lifecycle_zone = excluded.lifecycle_zone, "
+            "last_computed_at = datetime('now')",
             (profile_id,),
         )
     return changed

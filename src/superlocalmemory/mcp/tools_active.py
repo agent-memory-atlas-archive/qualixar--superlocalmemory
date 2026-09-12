@@ -287,6 +287,20 @@ def _upcoming_scheduled_facts(engine, now: datetime.datetime) -> list[dict]:
         # exclusive, so the horizon day itself is included.
         start = now.date().isoformat()
         end = (now + datetime.timedelta(days=_SCHEDULED_HORIZON_DAYS + 1)).date().isoformat()
+        # Resolved the way retrieval/scope_policy.py resolves it: `db` here is
+        # duck-typed on `.execute` alone, so a caller may hand us an object
+        # that is not a DatabaseManager. Reaching for the attribute directly
+        # raised inside this function's `except`, which swallowed the entire
+        # prospective surface rather than the filter -- silently, and only a
+        # test double noticed. Fall back to scope-only rather than to nothing.
+        current = ""
+        clause_fn = getattr(type(db), "current_fact_clause", None)
+        if callable(clause_fn):
+            try:
+                current = clause_fn(db)
+            except Exception:  # noqa: BLE001 -- fall back to scope-only
+                logger.warning("scheduled surface could not resolve its filter")
+                current = ""
         rows = db.execute(
             "SELECT fact_id, content, referenced_date"
             " FROM atomic_facts"
@@ -295,7 +309,7 @@ def _upcoming_scheduled_facts(engine, now: datetime.datetime) -> list[dict]:
             "   AND referenced_date IS NOT NULL"
             "   AND referenced_date >= ?"
             "   AND referenced_date < ?"
-            f"   {db.current_fact_clause()}"
+            f"   {current}"
             " ORDER BY referenced_date ASC"
             f" LIMIT {_SCHEDULED_LIMIT}",
             (engine.profile_id, start, end),
