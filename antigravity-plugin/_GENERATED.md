@@ -2,7 +2,7 @@
 
 Built by `scripts/build-antigravity-plugin.mjs` from `plugin-src/`. Version stamped from `plugin-src/manifest.json`.
 
-Version: **4.1.14**
+Version: **4.1.15**
 
 Do not edit by hand — regenerate instead.
 
