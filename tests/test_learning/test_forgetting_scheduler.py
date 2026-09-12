@@ -356,15 +356,26 @@ def test_decay_cycle_tracks_transitions(
     scheduler.run_decay_cycle("test_profile")
     scheduler._last_run_times.clear()  # Reset so we can run again
 
-    # Manually alter a fact's retention zone so it transitions on next run
+    # Manually alter a fact's retention zone so it transitions on next run,
+    # and age it past the active band.
+    #
+    # This used to rely on the fixture's 9-day age being enough to drop out of
+    # `active`. It was — only because the decay curve was parameterised in
+    # hours and treated anything older than a few days as fully forgotten.
+    # That was the bug (a real store had 5,546 of 5,561 memories in
+    # `forgotten`). On the store's actual timescale a nine-day-old memory is
+    # correctly still active, so the age is now set explicitly to something
+    # that genuinely transitions.
+    stale = (datetime.now(UTC) - timedelta(days=200)).isoformat()
     db_with_facts.execute(
-        "UPDATE fact_retention SET lifecycle_zone = 'active', retention_score = 1.0 "
+        "UPDATE fact_retention SET lifecycle_zone = 'active', "
+        "retention_score = 1.0, last_accessed_at = ? "
         "WHERE fact_id = 'fact_009' AND profile_id = 'test_profile'",
-        (),
+        (stale,),
     )
 
     # Second run should detect fact_009 transitioning from 'active' to its
-    # real computed zone (which will be lower due to 9*24h age)
+    # real computed zone.
     stats = scheduler.run_decay_cycle("test_profile")
     assert stats["transitions"] >= 1, "At least one zone transition expected"
 

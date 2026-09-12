@@ -275,20 +275,42 @@ class TestMaintenanceBackfill:
 
         assert counts["langevin_backfilled"] == 1
 
-    def test_backfill_sets_lifecycle(self) -> None:
-        """Backfilled facts should have a valid lifecycle value."""
+    def test_backfill_sets_lifecycle(self, monkeypatch) -> None:
+        """Backfilled facts get a valid lifecycle, written where it survives.
+
+        The assertion moved in 4.1.16. It used to check that ``update_fact``
+        carried ``lifecycle`` — which is exactly the write that
+        ``reconcile_profile_lifecycle`` reverts later in the same maintenance
+        tick, because ``fact_retention.lifecycle_zone`` is the authority and
+        ``atomic_facts.lifecycle`` is only its mirror. On a real store that
+        silently undid the whole fix: active went 111 -> 2,631 -> 111 inside
+        one tick.
+
+        The tier now goes through ``_persist_lifecycle``, which writes both
+        columns in one transaction. Same guarantee, asserted at the place that
+        actually holds it.
+        """
+        from superlocalmemory.core import maintenance as _m
+
         config = self._make_config()
         db = MagicMock()
         f1 = self._make_fact("f1", langevin_position=None, age_days=5.0)
         db.get_all_facts.return_value = [f1]
 
+        seen: list[tuple] = []
+        real = _m._persist_lifecycle
+        monkeypatch.setattr(
+            _m, "_persist_lifecycle",
+            lambda d, p, updates: seen.extend(updates) or len(updates),
+        )
         run_maintenance(db, config, "default")
 
-        # First update call is from backfill
-        first_call = db.update_fact.call_args_list[0]
-        updates = first_call[0][1]
-        assert "lifecycle" in updates
-        assert updates["lifecycle"] in {"active", "warm", "cold", "archived"}
+        assert seen, "backfill persisted no lifecycle at all"
+        fact_id, lifecycle, position = seen[0]
+        assert fact_id == "f1"
+        assert lifecycle in {"active", "warm", "cold", "archived"}
+        assert position is not None, "the position must persist too, or it reruns"
+        assert real is not None
 
     def test_returns_backfill_count_key(self) -> None:
         """Return dict should include langevin_backfilled key."""

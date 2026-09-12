@@ -98,6 +98,12 @@ _ZONE_WEIGHTS: dict[str, float] = {
 # EbbinghausCurve
 # ---------------------------------------------------------------------------
 
+#: Retention a baseline memory has after ``ARCHIVE_AFTER_DAYS`` of neglect.
+#: Anchors the decay CLOCK. Deliberately a constant rather than
+#: ``ForgettingConfig.archive_threshold`` — see ``store_scaled_strength``.
+_ARCHIVE_REFERENCE_RETENTION: float = 0.2
+
+
 class EbbinghausCurve:
     """Ebbinghaus forgetting curve with configurable strength formula.
 
@@ -142,6 +148,47 @@ class EbbinghausCurve:
 
         # HR-02: Clamp to [0.0, 1.0]
         return max(0.0, min(1.0, r))
+
+    def store_scaled_strength(self, strength: float) -> float:
+        """Rescale an hours-tuned strength onto the store's own timescale.
+
+        WHY THIS EXISTS. This curve models working memory: ``max_strength`` is
+        100, i.e. about four days. Fed real elapsed time from a persistent
+        store, a memory a month old computes ``R ~ 0`` and is filed
+        ``forgotten``. Measured on a real store, that put 5,546 of 5,561
+        memories in ``forgotten`` -- and via the mirror, 93.6% of the store
+        showed as archived. GitHub #136.
+
+        The curve's SHAPE is right; only its time constant was wrong. That
+        constant is taken from the ladder the product already documents in
+        ``core/tier_manager.py``: a baseline memory left alone for
+        ``ARCHIVE_AFTER_DAYS`` must have decayed to ``archive_threshold``.
+        Nothing new is invented, and this is the ONE place the conversion
+        lives -- the seed path and the decay path both call it, so they cannot
+        drift apart the way they did in 4.1.15.
+
+        Returns S in HOURS, so every existing caller works unchanged.
+        """
+        from superlocalmemory.core.tier_manager import ARCHIVE_AFTER_DAYS
+
+        cfg = self._config
+        baseline = self.memory_strength(
+            access_count=0, importance=0.5,
+            confirmation_count=0, emotional_salience=0.0,
+        )
+        # The reference retention is FIXED, not read from config. Deriving the
+        # clock from the configured ``archive_threshold`` would mean a caller
+        # tightening a CLASSIFICATION boundary silently rescaled TIME: a test
+        # setting ``archive_threshold=0.999`` to force quick forgetting got
+        # ``-log(0.999)`` and a thousand-year time constant, i.e. the exact
+        # opposite of what it asked for. Thresholds decide which band a
+        # retention lands in; they do not decide how fast retention falls.
+        decades = -math.log(_ARCHIVE_REFERENCE_RETENTION)
+        baseline_hours = (ARCHIVE_AFTER_DAYS * 24.0) / decades
+        scaled = baseline_hours * (
+            max(strength, cfg.min_strength) / max(baseline, 1e-6)
+        )
+        return min(scaled, baseline_hours * 1000.0)
 
     def trust_modulated_retention(
         self,
@@ -337,7 +384,12 @@ class EbbinghausCurve:
                 access_count, importance, confirmation_count, emotional_salience,
             )
             trust = fact.get("trust_score", 1.0)
-            ret = self.trust_modulated_retention(hours_since, strength, trust)
+            # Scaled to the store's timescale before decay is applied. Without
+            # this, anything older than a few days computes R ~ 0 and is filed
+            # `forgotten` regardless of how often it is used. GitHub #136.
+            ret = self.trust_modulated_retention(
+                hours_since, self.store_scaled_strength(strength), trust,
+            )
             zone = self.lifecycle_zone(ret)
 
             results.append({
