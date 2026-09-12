@@ -1,25 +1,29 @@
 # Copyright (c) 2026 Varun Pratap Bhardwaj / Qualixar
 # Licensed under AGPL-3.0-or-later
-"""Two columns holding the same fact must not each be the other's source.
+"""Retention state is the authority; ``atomic_facts.lifecycle`` mirrors it.
 
-GitHub #136. ``reconcile_profile_lifecycle`` synced BOTH ways in one
-transaction: ``atomic_facts.lifecycle`` seeded ``fact_retention.lifecycle_zone``
-for any fact without a retention row, and ``lifecycle_zone`` then overwrote
-``lifecycle`` for every fact that had one. With the maintenance pass writing
-``lifecycle`` on its own schedule, the two columns chased each other.
+GitHub #136 reported tiers that changed on their own. OBSERVED on the author's
+live store, 39 minutes apart, with no user activity:
 
-OBSERVED on the author's live store, 39 minutes apart, no user activity:
+    11:10   archived 5204 | cold 292 | warm  62 | active   2   -> 3,963 DISAGREE
+    11:49   warm  4054 | archived 986 | cold 408 | active 112  ->     0 disagree
 
-    11:10   archived 5204 | cold 292 | warm  62 | active   2   -> 3,963 rows DISAGREE
-    11:49   warm  4054 | archived 986 | cold 408 | active 112  ->     0 rows disagree
+The obvious reading is that ``reconcile_profile_lifecycle`` syncing both ways
+caused it, and 4.1.15 briefly "fixed" it by making the sync one-way from the
+mirror. That was wrong twice over:
 
-Every subsystem filtering ``lifecycle = 'active'`` -- timeline, insights,
-pattern_miner, consolidation_engine -- therefore got a different answer
-depending on when it asked.
+  - It broke the decay path. ``POST /api/v3/forgetting/run`` computes
+    ``lifecycle_zone`` from ``retention_score`` and then calls reconcile
+    precisely to push that into the mirror. Running it the other way made the
+    route throw away its own work -- caught by
+    ``tests/test_api/test_api_v33.py::TestForgettingRun``.
+  - It was not the cause. The oscillation came from the Langevin backfill
+    writing a RANDOM ``lifecycle`` for every NULL-position fact, which
+    reconcile then faithfully propagated. Fix the writer, not the mirror.
 
-One direction now: the Langevin position decides ``lifecycle``, and
-``lifecycle_zone`` mirrors it. The position is the only state with a physical
-meaning; the two columns are views of it.
+So this file pins two things: the direction, and the property that actually
+makes the flapping impossible -- the backfill is deterministic and touches a
+fact once, so there is nothing left oscillating for reconcile to carry.
 """
 
 from __future__ import annotations
@@ -45,12 +49,10 @@ def store(tmp_path: Path) -> DatabaseManager:
         "INSERT INTO memories (memory_id, profile_id, content) "
         "VALUES ('m1', ?, 'source')", (_PROFILE,),
     )
-    # Each pair disagrees, in a different direction.
     rows = [
-        ("disagree-1", "cold", "warm"),
-        ("disagree-2", "warm", "archive"),
-        ("disagree-3", "active", "cold"),
-        ("agree-1", "warm", "warm"),
+        ("decayed-to-archive", "active", "archive"),
+        ("decayed-to-cold", "active", "cold"),
+        ("agree", "warm", "warm"),
         ("no-retention-row", "cold", None),
     ]
     for fid, lifecycle, zone in rows:
@@ -73,91 +75,88 @@ def store(tmp_path: Path) -> DatabaseManager:
 
 def _lifecycle(db: DatabaseManager, fact_id: str) -> str:
     rows = db.execute(
-        "SELECT lifecycle FROM atomic_facts WHERE fact_id = ?", (fact_id,),
-    )
+        "SELECT lifecycle FROM atomic_facts WHERE fact_id = ?", (fact_id,))
     return str(dict(rows[0])["lifecycle"])
 
 
 def _zone(db: DatabaseManager, fact_id: str) -> str | None:
     rows = db.execute(
-        "SELECT lifecycle_zone FROM fact_retention WHERE fact_id = ?", (fact_id,),
-    )
+        "SELECT lifecycle_zone FROM fact_retention WHERE fact_id = ?", (fact_id,))
     return str(dict(rows[0])["lifecycle_zone"]) if rows else None
 
 
-class TestTheAtomicMirrorIsTheSource:
-    def test_reconcile_never_rewrites_the_lifecycle_column(
-        self, store: DatabaseManager,
-    ) -> None:
-        """The leg that caused the flapping."""
-        before = {
-            fid: _lifecycle(store, fid)
-            for fid in ("disagree-1", "disagree-2", "disagree-3",
-                        "agree-1", "no-retention-row")
-        }
+class TestRetentionIsTheAuthority:
+    def test_a_decayed_zone_reaches_the_mirror(self, store) -> None:
+        """What /forgetting/run calls reconcile FOR."""
         reconcile_profile_lifecycle(store, _PROFILE)
-        after = {fid: _lifecycle(store, fid) for fid in before}
-        assert after == before, f"reconcile moved the authority: {before} -> {after}"
+        assert _lifecycle(store, "decayed-to-cold") == "cold"
 
-    def test_the_zone_is_brought_into_line_with_it(
-        self, store: DatabaseManager,
-    ) -> None:
-        reconcile_profile_lifecycle(store, _PROFILE)
-        assert _zone(store, "disagree-1") == "cold"
-        assert _zone(store, "disagree-2") == "warm"
-        assert _zone(store, "disagree-3") == "active"
-
-    def test_a_fact_with_no_retention_row_gets_one(
-        self, store: DatabaseManager,
-    ) -> None:
-        reconcile_profile_lifecycle(store, _PROFILE)
-        assert _zone(store, "no-retention-row") == "cold"
-
-    def test_archived_maps_to_the_retention_spelling(
-        self, tmp_path: Path,
-    ) -> None:
-        """``atomic_facts`` says 'archived'; ``fact_retention`` says 'archive'.
+    def test_archive_maps_to_the_mirrors_spelling(self, store) -> None:
+        """``fact_retention`` says 'archive'; ``atomic_facts`` says 'archived'.
 
         Two vocabularies for one tier is how a mapping bug gets written.
         """
-        path = tmp_path / "m.db"
-        conn = sqlite3.connect(str(path))
-        create_all_tables(conn)
-        conn.execute(
-            "INSERT INTO memories (memory_id, profile_id, content) "
-            "VALUES ('m1', ?, 's')", (_PROFILE,),
-        )
-        conn.execute(
-            "INSERT INTO atomic_facts (fact_id, memory_id, profile_id, content,"
-            " lifecycle, scope, created_at) VALUES ('a1','m1',?,'x','archived',"
-            " 'global','2026-08-01T00:00:00+00:00')", (_PROFILE,),
-        )
-        conn.commit()
-        conn.close()
-        db = DatabaseManager(str(path))
-        reconcile_profile_lifecycle(db, _PROFILE)
-        assert _zone(db, "a1") == "archive"
+        reconcile_profile_lifecycle(store, _PROFILE)
+        assert _lifecycle(store, "decayed-to-archive") == "archived"
 
-    def test_it_is_idempotent(self, store: DatabaseManager) -> None:
-        """A second pass must find nothing left to change."""
+    def test_the_decayed_zone_itself_survives(self, store) -> None:
+        """The regression that inverting this caused: the row vanished.
+
+        ``test_run_forgetting_does_not_touch_archived`` reads this row back
+        after the route runs and fails with TypeError when it is gone.
+        """
+        reconcile_profile_lifecycle(store, _PROFILE)
+        assert _zone(store, "decayed-to-archive") == "archive"
+        assert _zone(store, "decayed-to-cold") == "cold"
+
+    def test_a_fact_with_no_retention_row_is_imported_from_the_mirror(
+        self, store,
+    ) -> None:
+        """A legacy row with only a mirror value must not be stranded."""
+        reconcile_profile_lifecycle(store, _PROFILE)
+        assert _zone(store, "no-retention-row") == "cold"
+
+    def test_it_is_idempotent(self, store) -> None:
         reconcile_profile_lifecycle(store, _PROFILE)
         snapshot = {
             fid: (_lifecycle(store, fid), _zone(store, fid))
-            for fid in ("disagree-1", "disagree-2", "disagree-3",
-                        "agree-1", "no-retention-row")
+            for fid in ("decayed-to-archive", "decayed-to-cold",
+                        "agree", "no-retention-row")
         }
         assert reconcile_profile_lifecycle(store, _PROFILE) == 0
         assert {
             fid: (_lifecycle(store, fid), _zone(store, fid)) for fid in snapshot
         } == snapshot
 
-    def test_it_does_not_clobber_the_retention_score(
-        self, store: DatabaseManager,
-    ) -> None:
-        """Only the zone is a mirror. The score is measured elsewhere."""
+    def test_it_does_not_clobber_the_retention_score(self, store) -> None:
+        """Only the zone is mirrored. The score is measured elsewhere."""
         reconcile_profile_lifecycle(store, _PROFILE)
         rows = store.execute(
             "SELECT retention_score FROM fact_retention WHERE fact_id = ?",
-            ("disagree-1",),
-        )
+            ("decayed-to-cold",))
         assert float(dict(rows[0])["retention_score"]) == pytest.approx(0.42)
+
+
+class TestNothingIsLeftOscillating:
+    """The property that actually makes #136's flapping impossible."""
+
+    def test_the_seed_is_stable_across_repeated_passes(self) -> None:
+        """The backfill used to hand reconcile a fresh random tier each time.
+
+        Reconcile propagated it faithfully, which is what made the mirror and
+        the zone appear to chase each other. Two passes, same answer, means
+        there is no oscillation for any direction of sync to carry.
+        """
+        import numpy as np
+
+        from superlocalmemory.core.maintenance import (
+            _LANGEVIN_DIM,
+            _seed_langevin_position,
+        )
+
+        radii = {
+            round(float(np.linalg.norm(_seed_langevin_position(
+                2, 45.0, 0.5, 0.3, _LANGEVIN_DIM, fact_id="fact-abc"))), 12)
+            for _ in range(30)
+        }
+        assert len(radii) == 1, f"the seed still varies between passes: {radii}"
