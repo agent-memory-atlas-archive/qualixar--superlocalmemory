@@ -5,6 +5,55 @@ All notable changes to SuperLocalMemory will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.15] — Retrieval-honesty release
+
+### Fixed
+
+- **A corrected memory stops being served as current.** Correcting a memory
+  made search worse than leaving the wrong one in place: the retirement was
+  recorded and recall honoured it, but every other read path kept serving the
+  old memory at full weight, and no amount of waiting changed that. On a real
+  5,560-memory store, 4.8% of search results were memories the store had
+  already decided were wrong — up to 12% on a topic-specific search. Search,
+  pinned context, the degraded start-up path and the scheduled-memory surface
+  now all resolve visibility from one place. (#136)
+- **The degraded start-up path filtered nothing.** When the daemon is
+  unreachable, session start-up falls back to a direct search. That fallback
+  applied no visibility rules at all, so it could hand an agent a withheld or
+  retired memory as opening context.
+- **`fetch` says which ids it could not find.** It returned success with an
+  empty result for an id it could not read — indistinguishable from the
+  answer for a memory that does not exist, on the one call an agent uses to
+  check that a write landed. It now names what it could not resolve, reports
+  partial misses, and accepts a list as well as a comma-separated string.
+  (#135)
+- **A new memory starts active instead of landing anywhere.** Where a memory
+  sat in its lifecycle was decided by a random simulation rather than by how
+  it had been used. Memories saved seconds apart could land in three
+  different tiers, and a freshly written memory could never reach the
+  most-available tier at all — on one store, 2 memories out of 5,560 were
+  active and 93.6% were marked archived, so features that read only active
+  memories were reading almost nothing. A memory now starts fully available
+  and moves down only as it goes unused, recovering when used again. The same
+  memory always lands in the same place. Existing stores are recomputed on
+  the next maintenance pass. (#136)
+- **The daemon stops burning a core while idle.** Reconfiguring or switching
+  profile built a new set of storage backends and abandoned the old ones
+  without closing them, leaving a full native thread pool and an orphaned
+  background worker running for the life of the process. Measured on one
+  machine after eleven days: 99 worker threads where 14 belong, at 89-97%
+  CPU with nothing to do. Two background loops also treated a failure as a
+  reason to retry immediately, holding them at full speed on work that could
+  never succeed. (#137)
+
+### Added
+
+- **Ask a busy daemon what it is doing.** `kill -USR1 <pid>` writes every
+  thread's stack to `thread-dump.log`. Diagnosing the high-CPU report needed
+  root on macOS and defeated the standard profiler on Linux, so on both
+  machines nobody could see inside the process. Python frames only — a native
+  thread with no Python frame stays invisible.
+
 ## [4.1.14] — Profile-correctness and reliability release
 
 ### Added
