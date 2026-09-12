@@ -37,14 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and moves down only as it goes unused, recovering when used again. The same
   memory always lands in the same place. Existing stores are recomputed on
   the next maintenance pass. (#136)
-- **The daemon stops burning a core while idle.** Reconfiguring or switching
-  profile built a new set of storage backends and abandoned the old ones
-  without closing them, leaving a full native thread pool and an orphaned
-  background worker running for the life of the process. Measured on one
-  machine after eleven days: 99 worker threads where 14 belong, at 89-97%
-  CPU with nothing to do. Two background loops also treated a failure as a
-  reason to retry immediately, holding them at full speed on work that could
-  never succeed. (#137)
+- **Two causes of wasted background work.** Reconfiguring or switching profile
+  built a new set of storage backends and abandoned the old ones without
+  closing them, leaving a native thread pool and an orphaned background worker
+  running for the life of the process. Two background loops also treated a
+  failure as a reason to retry immediately, holding them at full speed on work
+  that could never succeed. Both are fixed.
+
+  **This does not close #137.** The dominant cause of the reported high CPU is
+  separate and still open: the vector projection is written one memory at a
+  time, each write creates a new version of the vector store, and nothing ever
+  removes old versions. Measured on the author's machine: 5,561 memories, a
+  610 MB database — and a 17 GB vector store holding 50,580 versions. Every
+  vector operation walks that history, which is why CPU stays pinned with no
+  work queued. Setting `vector_backend` to `sqlite-vec` avoids it today.
 
 ### Added
 
