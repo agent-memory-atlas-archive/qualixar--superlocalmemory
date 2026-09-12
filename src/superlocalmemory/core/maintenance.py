@@ -136,28 +136,22 @@ def _retention_radius(
     # Imported here, like LangevinDynamics below: this module is loaded on the
     # daemon's start path and the config/ebbinghaus pair costs real time.
     from superlocalmemory.core.config import ForgettingConfig
-    from superlocalmemory.core.tier_manager import ARCHIVE_AFTER_DAYS
     from superlocalmemory.math.ebbinghaus import EbbinghausCurve
     from superlocalmemory.math.langevin import _MAX_NORM
 
-    config = ForgettingConfig()
-    curve = EbbinghausCurve(config)
+    curve = EbbinghausCurve(ForgettingConfig())
     strength = curve.memory_strength(
         access_count=access_count,
         importance=importance,
         confirmation_count=0,
         emotional_salience=0.0,
     )
-    baseline = curve.memory_strength(
-        access_count=0, importance=0.5,
-        confirmation_count=0, emotional_salience=0.0,
+    # Same conversion the decay path uses — one derivation, not two copies.
+    # 4.1.15 scaled the seed here and left the decay path unscaled, so the
+    # decay cycle overwrote every corrected tier minutes later.
+    retention = curve.retention(
+        max(0.0, age_days) * 24.0, curve.store_scaled_strength(strength),
     )
-    # S such that R(ARCHIVE_AFTER_DAYS) == archive_threshold for a baseline
-    # memory, then scaled by how much stronger than baseline this one is.
-    decades = -_math.log(max(config.archive_threshold, 1e-6))
-    baseline_days = ARCHIVE_AFTER_DAYS / decades
-    s_days = baseline_days * (strength / max(baseline, 1e-6))
-    retention = curve.retention(max(0.0, age_days), s_days)
     return min(max(1.0 - retention, 0.0), _MAX_NORM * 0.95)
 
 

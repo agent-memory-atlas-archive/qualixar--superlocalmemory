@@ -2429,12 +2429,19 @@ async def run_forgetting(request: Request):
                         (zone, pid, threshold),
                     )
 
-                # Ensure high-retention facts are active
+                # Ensure high-retention facts are active.
+                #
+                # ``archive``/``forgotten`` are deliberately NOT excluded here,
+                # unlike the demotion ladder above. A memory that is being used
+                # again must be able to climb back out -- README: "what pulls it
+                # back is being used". Excluding them made those two zones a
+                # one-way door, so when a mis-calibrated decay filed 5,546 of
+                # 5,561 memories as forgotten, nothing could ever reconsider
+                # them even after the calculation was corrected. GitHub #136.
                 conn.execute(
                     "UPDATE fact_retention "
                     "SET lifecycle_zone = 'active' "
-                    "WHERE profile_id = ? AND retention_score >= 0.65 "
-                    "AND lifecycle_zone NOT IN ('archive', 'forgotten')",
+                    "WHERE profile_id = ? AND retention_score >= 0.65",
                     (pid,),
                 )
 
