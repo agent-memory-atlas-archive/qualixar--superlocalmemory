@@ -161,6 +161,55 @@ def _retention_radius(
     return min(max(1.0 - retention, 0.0), _MAX_NORM * 0.95)
 
 
+def _persist_lifecycle(
+    db: object,
+    profile_id: str,
+    updates: "list[tuple[str, str, object]]",
+) -> int:
+    """Write a computed tier to the authority AND the mirror, together.
+
+    WHY THIS EXISTS. Every lifecycle write in this module used to be
+    ``db.update_fact(fact_id, {"lifecycle": ...})`` -- the mirror only.
+    ``fact_retention.lifecycle_zone`` is the authority, and
+    ``reconcile_profile_lifecycle`` runs later in the SAME maintenance tick and
+    syncs authority -> mirror. So the pass computed a tier, wrote it to the
+    losing column, and reconcile faithfully threw it away. Observed on a real
+    store: the backfill moved ``active`` from 111 to 2,631, and one tick later
+    it was 111 again.
+
+    ``set_fact_lifecycle_zone`` writes both in one transaction and handles the
+    spelling difference -- ``atomic_facts`` says ``archived``,
+    ``fact_retention`` says ``archive``.
+
+    ``updates`` is ``(fact_id, lifecycle, position_or_None)``. The position has
+    no mirror, so it still goes through ``update_fact``; without it the backfill
+    would recompute the same facts on every pass and never converge.
+
+    Returns the number of facts whose tier was written.
+    """
+    if not updates:
+        return 0
+    from superlocalmemory.core.lifecycle_state import set_fact_lifecycle_zone
+
+    for fact_id, _lifecycle, position in updates:
+        if position is not None:
+            db.update_fact(fact_id, {"langevin_position": position})
+
+    by_zone: dict[str, list[str]] = {}
+    for fact_id, lifecycle, _position in updates:
+        by_zone.setdefault(str(lifecycle), []).append(fact_id)
+
+    written = 0
+    for zone, fact_ids in by_zone.items():
+        try:
+            written += set_fact_lifecycle_zone(
+                db, fact_ids, zone, profile_id=profile_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- maintenance is best-effort
+            logger.warning("lifecycle persist failed for %s: %s", zone, exc)
+    return written
+
+
 def _seed_langevin_position(
     access_count: int,
     age_days: float,
@@ -424,10 +473,9 @@ def run_maintenance(
                 )
                 weight = ld.compute_lifecycle_weight(position)
                 lifecycle = ld.get_lifecycle_state(weight).value
-                db.update_fact(f.fact_id, {
-                    "langevin_position": position,
-                    "lifecycle": lifecycle,
-                })
+                _persist_lifecycle(
+                    db, profile_id, [(f.fact_id, lifecycle, position)],
+                )
                 f.langevin_position = position  # update in-memory for step 1b
                 backfilled += 1
 
@@ -462,11 +510,10 @@ def run_maintenance(
 
             if fact_dicts:
                 results = ld.batch_step(fact_dicts)
-                for r in results:
-                    db.update_fact(r["fact_id"], {
-                        "langevin_position": r["position"],
-                        "lifecycle": r["lifecycle"],
-                    })
+                _persist_lifecycle(db, profile_id, [
+                    (r["fact_id"], r["lifecycle"], r["position"])
+                    for r in results
+                ])
                 counts["langevin_updated"] = len(results)
         except Exception as exc:
             logger.warning("Langevin maintenance failed: %s", exc)
@@ -509,10 +556,9 @@ def run_maintenance(
                         importance=f.importance,
                     )
                     lifecycle = coupled_ld.get_lifecycle_state(weight).value
-                    db.update_fact(f.fact_id, {
-                        "langevin_position": new_pos,
-                        "lifecycle": lifecycle,
-                    })
+                    _persist_lifecycle(
+                        db, profile_id, [(f.fact_id, lifecycle, new_pos)],
+                    )
                     coupled_count += 1
 
             counts["fisher_coupled"] = coupled_count
@@ -666,7 +712,7 @@ def run_maintenance(
                 )
                 if zone == current_zone:
                     continue
-                db.update_fact(f.fact_id, {"lifecycle": zone})
+                _persist_lifecycle(db, profile_id, [(f.fact_id, zone, None)])
             counts["ebbinghaus_coupled"] = elc_count
         except Exception as exc:
             logger.warning("Ebbinghaus-Langevin coupling failed: %s", exc)
