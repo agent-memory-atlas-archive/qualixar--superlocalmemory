@@ -188,6 +188,36 @@ def _compose_visible_clause(
     return clause
 
 
+def _compose_current_clause(prefix: str, *, has_temporal: bool) -> str:
+    """The AND-clause that excludes a fact the store has already retired.
+
+    Separate from ``_compose_visible_clause`` on purpose. Withholding and
+    retirement are different guarantees with different audiences: a withheld
+    row is a model's non-answer that nobody should ever be shown, while a
+    retired row is a real memory that was true and is now superseded. History,
+    audit and export must still reach it. Only the surfaces answering "what do
+    I know NOW" must not.
+
+    The predicate is lifted verbatim from ``get_pinned``, which has carried it
+    inline since corrections shipped. That one path was right and the other
+    nineteen were never told. GitHub #136.
+
+    Alias is ``tv_cur`` rather than ``tv`` because callers splicing this in
+    already bind ``tv`` -- ``get_correction_inadmissible_fact_ids`` does.
+    """
+    if not has_temporal:
+        return ""
+    table = f"{prefix}." if prefix else ""
+    return (
+        " AND NOT EXISTS ("
+        "    SELECT 1 FROM fact_temporal_validity tv_cur"
+        f"    WHERE tv_cur.fact_id = {table}fact_id"
+        f"      AND tv_cur.profile_id = {table}profile_id"
+        "      AND tv_cur.system_expired_at IS NOT NULL"
+        ")"
+    )
+
+
 def visible_fact_clause_for_connection(
     conn: sqlite3.Connection,
     prefix: str = "",
@@ -250,6 +280,34 @@ def visible_fact_clause_for_connection(
         has_quarantine=_has("quarantined"),
         include_quarantined=include_quarantined,
     )
+
+
+def current_fact_clause_for_connection(
+    conn: sqlite3.Connection,
+    prefix: str = "",
+    *,
+    include_quarantined: bool = False,
+) -> str:
+    """``current_fact_clause`` for a caller that hand-rolls its SQL.
+
+    Exists for the same reason its visible-only sibling does, and for one more:
+    ``mcp/tools_active.py`` opens a bare read connection on the degraded
+    ``session_init`` path, so it can reach neither a DatabaseManager nor the
+    recall engine. That path was outside BOTH guarantees until 4.1.15.
+    """
+    try:
+        has_temporal = any(
+            True
+            for _ in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='fact_temporal_validity'"
+            )
+        )
+    except sqlite3.Error:
+        has_temporal = False
+    return visible_fact_clause_for_connection(
+        conn, prefix, include_quarantined=include_quarantined,
+    ) + _compose_current_clause(prefix, has_temporal=has_temporal)
 
 
 class DatabaseManager:
@@ -978,13 +1036,7 @@ class DatabaseManager:
         # is not merely shown, it is asserted as background truth.
         rows = self.execute(
             f"SELECT f.* FROM atomic_facts f WHERE {where} AND f.pinned = 1 "
-            f"{self.visible_fact_clause('f')} "
-            "AND NOT EXISTS ("
-            "    SELECT 1 FROM fact_temporal_validity tv "
-            "    WHERE tv.fact_id = f.fact_id "
-            "      AND tv.profile_id = f.profile_id "
-            "      AND tv.system_expired_at IS NOT NULL"
-            ") "
+            f"{self.current_fact_clause('f')} "
             "ORDER BY importance DESC",
             (*params,),
         )
@@ -1044,6 +1096,47 @@ class DatabaseManager:
         if present:
             self._quarantine_col_present = True
         return present
+
+    def _has_temporal_validity_table(self) -> bool:
+        """Whether the store carries ``fact_temporal_validity``.
+
+        Same shape and same reason as ``_has_quarantine_column``: cached once
+        True, re-checked while absent. A bare DatabaseManager can be pointed at
+        a store engine init never touched, and filtering against an absent
+        table would turn a cosmetic gap into total read failure.
+        """
+        if getattr(self, "_temporal_table_present", False):
+            return True
+        try:
+            present = any(
+                dict(row).get("name") == "fact_temporal_validity"
+                for row in self.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='fact_temporal_validity'"
+                )
+            )
+        except sqlite3.Error:
+            return False
+        if present:
+            self._temporal_table_present = True
+        return present
+
+    def current_fact_clause(
+        self, prefix: str = "", *, include_quarantined: bool = False,
+    ) -> str:
+        """``visible_fact_clause`` PLUS "and the store still believes it".
+
+        Use this on any surface that answers "what do I know now": search,
+        pins, the degraded recall path, the dashboard. Use the plain
+        ``visible_fact_clause`` on history, audit and export, which must keep
+        showing a memory that was retired -- "why did my memory change" is a
+        question this product has to be able to answer.
+        """
+        return self.visible_fact_clause(
+            prefix, include_quarantined=include_quarantined,
+        ) + _compose_current_clause(
+            prefix, has_temporal=self._has_temporal_validity_table(),
+        )
 
     def visible_fact_clause(
         self, prefix: str = "", *, include_quarantined: bool = False,
@@ -1668,7 +1761,7 @@ class DatabaseManager:
             f"""SELECT f.* FROM atomic_facts_fts AS fts
                JOIN atomic_facts AS f ON f.fact_id = fts.fact_id
                WHERE fts.atomic_facts_fts MATCH ? AND {where}
-                     {self.visible_fact_clause('f')}
+                     {self.current_fact_clause('f')}
                ORDER BY fts.rank LIMIT ?""",
             (match_expr, *params, limit),
         )

@@ -115,17 +115,31 @@ class TestSeedLangevinPosition:
         assert isinstance(pos, list)
         assert len(pos) == 8
 
-    def test_radius_matches_equilibrium(self) -> None:
-        """Seeded position radius should equal the computed equilibrium radius."""
+    def test_radius_is_the_facts_retention(self) -> None:
+        """Seeded radius is 1 - R(t), not the old equilibrium formula.
+
+        This test used to assert the radius equalled
+        ``_compute_equilibrium_radius``. That contract was replaced in 4.1.15:
+        the formula scales as sqrt(dim) against dimension-independent band
+        boundaries, so its entire reachable range was [0.5210, 0.6330] and
+        ACTIVE was unreachable for every possible input. GitHub #136.
+
+        The assertion is kept in the same shape -- seeded radius equals the
+        authority -- with the authority corrected.
+        """
+        from superlocalmemory.core.maintenance import _retention_radius
+
         for _ in range(20):
             pos = _seed_langevin_position(
                 access_count=10, age_days=30.0, importance=0.7, dim=8,
+                fact_id="stable",
             )
-            expected_r = _compute_equilibrium_radius(
+            expected_r = _retention_radius(
                 access_count=10, age_days=30.0, importance=0.7,
             )
-            actual_r = float(np.linalg.norm(pos))
-            np.testing.assert_allclose(actual_r, expected_r, atol=1e-6)
+            np.testing.assert_allclose(
+                float(np.linalg.norm(pos)), expected_r, atol=1e-6,
+            )
 
     def test_inside_unit_ball(self) -> None:
         pos = _seed_langevin_position(

@@ -481,7 +481,7 @@ def _apply_predecessor_temporal(
             "WHERE case_id=?",
             (*tuple(prior), case.case_id),
         )
-    conn.execute(
+    cursor = conn.execute(
         "UPDATE fact_temporal_validity SET "
         "valid_until=COALESCE(?, valid_until), system_expired_at=?, "
         "invalidated_by=?, invalidation_reason=? WHERE fact_id=? AND profile_id=?",
@@ -494,6 +494,17 @@ def _apply_predecessor_temporal(
             case.profile_id,
         ),
     )
+    if cursor.rowcount != 1:
+        # Defence in depth, not a known live failure: the read above and the
+        # insert-if-missing use this same (fact_id, profile_id), inside one
+        # serialized transaction, so a zero-row update should be unreachable.
+        # It is asserted because the alternative is review_correction returning
+        # "applied" having retired nothing -- and supersession is the ONE
+        # signal every read path now resolves its answer from. Its sibling
+        # _restore_predecessor_temporal has always checked; this one did not.
+        raise CorrectionNotFoundError(
+            "predecessor temporal record was not superseded"
+        )
 
 
 def _restore_predecessor_temporal(conn: sqlite3.Connection, case: CorrectionCase) -> None:

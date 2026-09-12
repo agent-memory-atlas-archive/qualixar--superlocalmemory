@@ -169,6 +169,7 @@ from superlocalmemory.storage.migrations import (
     M048_upcoming_holds_only_what_is_upcoming as _M048,
     M049_a_schema_version_marker_is_one_row as _M049,
     M050_execution_learning_v2 as _M050,
+    M051_lifecycle_is_recomputed_not_resampled as _M051,
 )
 from superlocalmemory.storage.migrations import (
     M043_quarantine_display_summaries as _M043,
@@ -377,6 +378,10 @@ DEFERRED_MIGRATIONS: list[Migration] = [
     # versions held as 3,496 rows on one store and 234,348 on another. No
     # dependency -- it touches a bookkeeping table no other migration reads.
     Migration(name=_M049.NAME, db_target="memory", ddl=_M049.DDL),
+    # M051 clears lifecycle positions that were thermal noise, so the
+    # maintenance backfill recomputes them from the forgetting curve.
+    # No dependency: it clears one column no other migration reads.
+    Migration(name=_M051.NAME, db_target="memory", ddl=_M051.DDL),
 ]
 
 

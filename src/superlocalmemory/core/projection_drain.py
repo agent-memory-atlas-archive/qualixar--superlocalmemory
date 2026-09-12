@@ -118,6 +118,68 @@ class DrainResult:
         }
 
 
+class _VectorBatch:
+    """Collects a drain pass's vector writes so it creates ONE version, not N.
+
+    ``add_vectors`` issues a LanceDB ``merge_insert``, a whole-table operation
+    that creates a new version of the store. It used to be called once per
+    fact, so a store accumulated one version per memory with nothing removing
+    them: 5,561 memories produced a 17 GB vector store holding 50,580 versions,
+    and every vector operation then had to walk that history. GitHub #137.
+
+    Splits on ``profile_id`` because ``add_vectors`` takes exactly one, and a
+    batch that merged two tenants' vectors under one id would file a memory
+    against the wrong owner.
+    """
+
+    __slots__ = ("_items",)
+
+    def __init__(self) -> None:
+        self._items: list[tuple[str, object, str, str]] = []
+
+    @property
+    def pending(self) -> int:
+        return len(self._items)
+
+    def add(self, fact_id: str, embedding: object, tier: str,
+            profile_id: str) -> None:
+        self._items.append((fact_id, embedding, tier, profile_id))
+
+    def flush(self, vector: "Any | None") -> None:
+        """Write everything collected. Clears the buffer even with no backend.
+
+        Raises whatever the backend raises: the caller must not clear an outbox
+        row for a vector that did not land.
+        """
+        items, self._items = self._items, []
+        if not items or vector is None:
+            return
+        grouped: dict[str, tuple[list, list, list]] = {}
+        for fact_id, embedding, tier, profile_id in items:
+            ids, embeddings, tiers = grouped.setdefault(
+                profile_id, ([], [], []),
+            )
+            ids.append(fact_id)
+            embeddings.append(embedding)
+            tiers.append(tier)
+        for profile_id, (ids, embeddings, tiers) in grouped.items():
+            vector.add_vectors(ids, embeddings, tiers, profile_id)
+
+
+def _should_keep_draining(handled: int, failed: int, batch: int) -> bool:
+    """Whether a drain pass earned another immediate pass.
+
+    A full batch used to be enough, counting failures as activity. A batch of
+    permanently failing rows satisfies that with ``handled == 0``, and the
+    outbox retires nothing on failure -- ``claim_batch`` has no WHERE and
+    ``record_failure`` only increments a counter -- so the same rows came back
+    every pass, forever, with no wait between them. GitHub #137.
+
+    Progress, not activity: at least one row must have cleared.
+    """
+    return handled > 0 and (handled + failed) >= batch
+
+
 class ProjectionDrain:
     """Applies queued facts to the graph and vector projections.
 
@@ -190,7 +252,9 @@ class ProjectionDrain:
                 # should drain continuously rather than one batch per tick.
                 while not self._stop.is_set():
                     result = self.drain_once()
-                    if result.handled + result.failed < DEFAULT_BATCH:
+                    if not _should_keep_draining(
+                        result.handled, result.failed, DEFAULT_BATCH,
+                    ):
                         break
             except Exception as exc:  # pragma: no cover - worker must not die
                 # A worker that exits on an unexpected error would leave the
@@ -216,21 +280,51 @@ class ProjectionDrain:
             return result
 
         with self._pass_lock:
+            batch = _VectorBatch()
+            staged: list[tuple[dict[str, Any], str]] = []
             for row in projection_outbox.claim_batch(self._db, limit=limit):
-                self._apply_row(row, graph, vector, result)
+                outcome = self._apply_row(row, graph, vector, result, batch)
+                if outcome is not None:
+                    staged.append((row, outcome))
+            # The vectors must be durable BEFORE any outbox row is cleared.
+            # Clearing first and writing after would lose a pass's embeddings
+            # to a crash with nothing left queued to notice.
+            try:
+                batch.flush(vector)
+            except Exception as exc:  # noqa: BLE001
+                # The whole batch failed together, so it fails together. Graph
+                # projection is idempotent, so the retry re-does it harmlessly.
+                for row, _ in staged:
+                    attempts = projection_outbox.record_failure(
+                        self._db, row["fact_id"], str(exc),
+                    )
+                    result.failed += 1
+                    result.errors.append(f"{row['fact_id'][:12]}: {exc}")
+                    log = (logger.warning if attempts >= LOUD_AFTER_ATTEMPTS
+                           else logger.debug)
+                    log("vector batch failed for %s after %d attempt(s): %s",
+                        row["fact_id"][:12], attempts, exc)
+                staged = []
+            for row, outcome in staged:
+                self._resolve(row, outcome, result)
         return result
 
     def _apply_row(
-        self, row: dict[str, Any], graph: Any, vector: Any, result: DrainResult,
-    ) -> None:
+        self, row: dict[str, Any], graph: Any, vector: Any,
+        result: DrainResult, batch: "_VectorBatch",
+    ) -> "str | None":
+        """Project one fact. Returns its outcome, or None if it failed.
+
+        The outcome is returned rather than resolved here: the pass's vector
+        writes are still buffered at this point, and clearing an outbox row
+        before its vector is durable would lose the embedding to a crash.
+        """
         fact_id = row["fact_id"]
-        revision = row["revision"]
         try:
             if row["op"] == projection_outbox.OP_DELETE:
                 self._remove(fact_id, graph, vector)
-                outcome = "removed"
-            else:
-                outcome = self._project(fact_id, graph, vector)
+                return "removed"
+            return self._project(fact_id, graph, vector, batch)
         except Exception as exc:
             attempts = projection_outbox.record_failure(self._db, fact_id, str(exc))
             result.failed += 1
@@ -240,9 +334,13 @@ class ProjectionDrain:
                 "projection failed for %s after %d attempt(s): %s",
                 fact_id[:12], attempts, exc,
             )
-            return
+            return None
 
-        if projection_outbox.resolve(self._db, fact_id, revision):
+    def _resolve(
+        self, row: dict[str, Any], outcome: str, result: DrainResult,
+    ) -> None:
+        """Clear one outbox row now that its projections are durable."""
+        if projection_outbox.resolve(self._db, row["fact_id"], row["revision"]):
             setattr(result, outcome, getattr(result, outcome) + 1)
         else:
             # The fact was written again while this projection was in flight,
@@ -254,7 +352,8 @@ class ProjectionDrain:
     # The projections themselves
     # ------------------------------------------------------------------
 
-    def _project(self, fact_id: str, graph: Any, vector: Any) -> str:
+    def _project(self, fact_id: str, graph: Any, vector: Any,
+                 batch: "_VectorBatch") -> str:
         """Bring one fact's projection up to date. Returns the outcome name."""
         state = self._visibility(fact_id)
         if state == "absent":
@@ -278,7 +377,7 @@ class ProjectionDrain:
         if graph is not None:
             self._project_graph(fact, graph)
         if vector is not None:
-            self._project_vector(fact, vector)
+            self._project_vector(fact, batch)
         return "projected"
 
     def _visibility(self, fact_id: str) -> str:
@@ -334,20 +433,24 @@ class ProjectionDrain:
                 float(edge.get("weight") or 1.0), profile_id=profile_id,
             )
 
-    def _project_vector(self, fact: Any, vector: Any) -> None:
-        """Write this fact's embedding to the vector store.
+    def _project_vector(self, fact: Any, batch: "_VectorBatch") -> None:
+        """Buffer this fact's embedding for the pass's single vector write.
 
         A fact with no embedding yet is not an error: ingestion is
         queryable-first, so the vector arrives with enrichment and the update
         that writes it queues the fact again.
+
+        Buffered rather than written: one ``add_vectors`` per fact is one
+        LanceDB version per fact, which is how a 5,561-memory store came to
+        hold 50,580 versions in 17 GB. GitHub #137.
         """
         embedding = getattr(fact, "embedding", None)
         if not embedding:
             return
         lifecycle = getattr(fact, "lifecycle", None)
         tier = getattr(lifecycle, "value", lifecycle) or "active"
-        vector.add_vectors(
-            [fact.fact_id], [embedding], [tier],
+        batch.add(
+            fact.fact_id, embedding, tier,
             getattr(fact, "profile_id", "default") or "default",
         )
 

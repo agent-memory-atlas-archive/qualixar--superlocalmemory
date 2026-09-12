@@ -18,6 +18,8 @@ License: AGPL-3.0-or-later
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
+import os
 import threading
 from typing import TYPE_CHECKING
 
@@ -26,6 +28,42 @@ if TYPE_CHECKING:
     from superlocalmemory.storage.database import DatabaseManager
 
 logger = logging.getLogger(__name__)
+
+
+
+# How much vector-store version history to keep. Every write to the vector
+# store creates a version and nothing used to remove them: a 5,561-memory
+# store reached 50,580 versions in 17 GB, and each vector operation then had
+# to walk that history -- the daemon in GitHub #137 held a core at 90%+ with
+# an empty queue. A week is enough to debug a bad projection and short enough
+# that the history cannot run away.
+_VECTOR_HISTORY_DAYS = float(os.environ.get("SLM_VECTOR_HISTORY_DAYS", "7"))
+
+
+def compact_vector_store() -> dict:
+    """Drop vector-store versions older than the retention window.
+
+    Best-effort and never raises: a maintenance pass that cannot compact must
+    not take the daemon down, and the next tick will try again.
+
+    ``delete_unverified`` stays OFF here. It removes files no manifest
+    references, which is exactly what an in-flight write is creating -- safe
+    only with no writer attached, i.e. the offline repair path.
+    """
+    try:
+        from superlocalmemory.core.backend_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator()
+        if orchestrator is None:
+            return {"ok": False, "reason": "no orchestrator"}
+        backend = orchestrator.get_vector_backend()
+        compact = getattr(backend, "compact", None)
+        if not callable(compact):
+            return {"ok": False, "reason": "backend cannot compact"}
+        return compact(retention=timedelta(days=_VECTOR_HISTORY_DAYS))
+    except Exception as exc:  # noqa: BLE001 -- maintenance is best-effort
+        logger.warning("vector store compaction skipped: %s", exc)
+        return {"ok": False, "reason": str(exc)}
 
 
 class MaintenanceScheduler:
@@ -262,6 +300,8 @@ class MaintenanceScheduler:
                         profile_id,
                         exc,
                     )
+
+            compact_vector_store()
 
             # V3.4.11: Graph pruning (remove orphan edges)
             # v3.8.4-G: thread GraphPruningConfig params so dashboard changes

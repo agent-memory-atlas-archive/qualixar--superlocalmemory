@@ -44,7 +44,7 @@ from pathlib import Path
 #: be additive is a silent bad write.  Those are not comparable, and judging
 #: additivity per migration is exactly the judgement that let it fall three
 #: behind.
-SUPPORTED_SCHEMA_VERSION: int = 50
+SUPPORTED_SCHEMA_VERSION: int = 51
 
 
 class SchemaVersionError(RuntimeError):

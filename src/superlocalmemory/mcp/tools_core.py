@@ -24,7 +24,7 @@ from superlocalmemory.core.config import CANONICAL_LIST_LIMIT, CANONICAL_RECALL_
 from superlocalmemory.core.operation_request import OperationKind
 from superlocalmemory.infra.data_root import state_path
 from superlocalmemory.mcp._daemon_proxy import daemon_unavailable_error
-from superlocalmemory.mcp.shared import authorize_mcp_mutation
+from superlocalmemory.mcp.shared import authorize_mcp_mutation, parse_id_list
 
 logger = logging.getLogger(__name__)
 
@@ -554,13 +554,30 @@ def register_core_tools(server, get_engine: Callable) -> None:
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
     @admits(OperationKind.RECALL)
-    async def fetch(fact_ids: str) -> dict:
-        """Fetch full details for specific fact IDs (comma-separated)."""
+    async def fetch(fact_ids: "str | list[str]") -> dict:
+        """Fetch full details for specific fact IDs (comma-separated or a list).
+
+        Reports every id it could not resolve. Before 4.1.15 an unmatched token
+        returned ``success: true, count: 0`` -- indistinguishable from a
+        correct answer for a fact that does not exist, on the one tool an agent
+        uses to verify that a write landed. GitHub #135.
+        """
         try:
             engine = get_engine()
-            ids = [fid.strip() for fid in fact_ids.split(",") if fid.strip()]
+            ids = parse_id_list(fact_ids)
+            if not ids:
+                return {
+                    "success": False,
+                    "error": (
+                        f"fetch could not read any fact id from {fact_ids!r}. "
+                        "Pass a comma-separated string or a list of ids."
+                    ),
+                    "results": [], "count": 0, "not_found": [],
+                }
             pid = await _runtime_profile(get_engine)
             facts = engine._db.get_facts_by_ids(ids, pid)
+            found = {f.fact_id for f in facts}
+            not_found = [fid for fid in ids if fid not in found]
             items = []
             for f in facts:
                 items.append({
@@ -575,7 +592,20 @@ def register_core_tools(server, get_engine: Callable) -> None:
                     "lifecycle": f.lifecycle.value,
                     "access_count": f.access_count,
                 })
-            return {"success": True, "results": items, "count": len(items)}
+            if not items:
+                return {
+                    "success": False,
+                    "error": (
+                        "no fact matched "
+                        + ", ".join(repr(fid) for fid in not_found)
+                        + f" in profile {pid!r}"
+                    ),
+                    "results": [], "count": 0, "not_found": not_found,
+                }
+            return {
+                "success": True, "results": items, "count": len(items),
+                "not_found": not_found,
+            }
         except Exception as exc:
             logger.exception("fetch failed")
             return {"success": False, "error": str(exc)}

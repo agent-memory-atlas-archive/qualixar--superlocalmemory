@@ -14,6 +14,8 @@ Part of Qualixar | Author: Varun Pratap Bhardwaj
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import importlib.util
 import logging
 import sqlite3
@@ -125,6 +127,60 @@ class LanceDBVectorBackend:
         except Exception:  # pragma: no cover — schema introspection is best-effort
             logger.debug("Could not read persisted vector width", exc_info=True)
         return None
+
+    def compact(
+        self,
+        *,
+        retention: "timedelta | None" = None,
+        delete_unverified: bool = False,
+    ) -> dict:
+        """Drop version history this table no longer needs.
+
+        WHY THIS EXISTS. Every write to a Lance table creates a new version,
+        and ``_project_vector`` writes ONE FACT AT A TIME -- so a store gets one
+        version per memory, forever, and nothing ever removed them. Measured on
+        a real store: 5,561 memories, a 610 MB SQLite database, and a **17 GB**
+        vector store holding **50,580 versions**. Every vector operation walks
+        that history, which is why the daemon in GitHub #137 held a core at
+        90%+ with an empty work queue and no Python thread busy.
+
+        Reproduced in miniature, 300 facts written one at a time:
+
+            before  rows=300  versions=300  size=6.5M
+            after   rows=300  versions=  1  size=128K
+
+        ``delete_unverified`` also removes files no manifest references. Those
+        are exactly the files an in-flight write is creating, so it is only
+        safe with no writer attached -- the scheduled path leaves it off and
+        the offline repair turns it on.
+
+        Never raises: a maintenance pass that cannot compact must not take the
+        daemon down with it.
+        """
+        table = self._table
+        if table is None:
+            return {"ok": False, "reason": "no table"}
+        try:
+            before = len(table.list_versions())
+        except Exception:
+            before = -1
+        try:
+            table.optimize(
+                cleanup_older_than=retention,
+                delete_unverified=delete_unverified,
+            )
+        except Exception as exc:  # noqa: BLE001 -- maintenance is best-effort
+            logger.warning("vector store compaction failed: %s", exc)
+            return {"ok": False, "reason": str(exc), "versions_before": before}
+        try:
+            after = len(table.list_versions())
+        except Exception:
+            after = -1
+        if before > 0 and after > 0:
+            logger.info(
+                "vector store compacted: %d versions -> %d", before, after,
+            )
+        return {"ok": True, "versions_before": before, "versions_after": after}
 
     def close(self) -> None:
         """Release this backend's native table and connection references."""

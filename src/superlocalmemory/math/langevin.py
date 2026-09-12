@@ -52,16 +52,29 @@ from typing import Any
 
 import numpy as np
 
+from superlocalmemory.core.config import ForgettingConfig
 from superlocalmemory.storage.models import MemoryLifecycle
 
 # ---------------------------------------------------------------------------
 # Lifecycle zone boundaries (radius thresholds on the unit ball)
 # ---------------------------------------------------------------------------
 
-_RADIUS_ACTIVE: float = 0.3    # [0, 0.3)    -> ACTIVE
-_RADIUS_WARM: float = 0.55     # [0.3, 0.55) -> WARM
-_RADIUS_COLD: float = 0.8      # [0.55, 0.8) -> COLD
-                                # [0.8, 1.0)  -> ARCHIVED
+# Derived, not chosen. A memory's radius is 1 - R(t), its Ebbinghaus
+# retention, so each radial boundary is one minus the retention threshold that
+# EbbinghausCurve.lifecycle_zone already uses. Two coordinate systems for one
+# quantity, rather than two authorities that disagree and then flap.
+#
+# That this was always the intended relationship is visible in the numbers the
+# constants USED to hold: _RADIUS_COLD was 0.8, which is exactly
+# 1 - archive_threshold. The other two had drifted. GitHub #136.
+_ACTIVE_RETENTION: float = 0.8   # EbbinghausCurve.lifecycle_zone: R > 0.8
+_WARM_RETENTION: float = 0.5     # EbbinghausCurve.lifecycle_zone: R > 0.5
+
+_RADIUS_ACTIVE: float = 1.0 - _ACTIVE_RETENTION   # 0.20  [0, .20) -> ACTIVE
+_RADIUS_WARM: float = 1.0 - _WARM_RETENTION       # 0.50  [.20,.50) -> WARM
+_RADIUS_COLD: float = 1.0 - ForgettingConfig().archive_threshold
+                                                   # 0.80  [.50,.80) -> COLD
+                                                   #       [.80, 1)  -> ARCHIVED
 
 # Potential coefficients (defaults)
 # Alpha must be > 0.5*T*(d-2)/lam_inv ≈ 1.8 at T=0.3 for confinement

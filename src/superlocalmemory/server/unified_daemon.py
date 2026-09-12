@@ -6051,6 +6051,19 @@ def _ops_failure_counts(engine, application) -> dict:
     return result
 
 
+def _materializer_should_idle(
+    pending: object, durable_complete: int, durable_failed: int,
+) -> bool:
+    """Whether the materializer pass earned a sleep before the next one.
+
+    ``durable_failed`` used to suppress the sleep. The pass runs one operation
+    at a time, so a single operation that cannot succeed kept this loop at full
+    speed indefinitely, re-reaping and re-listing on every iteration. A failure
+    is activity, not progress. GitHub #137.
+    """
+    return not pending and not durable_complete
+
+
 def _reap_stuck_ingestion(db) -> list[str]:
     """Terminalize expired enrichment leases that exhausted retries.
 
@@ -6260,7 +6273,9 @@ def _start_pending_materializer() -> None:
                 # under whichever profile happens to be active now.
                 _active_profile = runtime.snapshot.profile_id
                 pending = get_pending(limit=50, profile_id=_active_profile)
-                if not pending and not durable_complete and not durable_failed:
+                if _materializer_should_idle(
+                    pending, durable_complete, durable_failed,
+                ):
                     time.sleep(1.0)
                     continue
                 if pending:
@@ -6340,9 +6355,62 @@ def _stop_pending_materializer(timeout: float = 5.0) -> bool:
     return True
 
 
+_thread_dump_file = None
+
+
+def install_thread_dump_signal() -> "os.PathLike | str | None":
+    """Make ``kill -USR1 <pid>`` dump every Python thread's stack to a file.
+
+    WHY THIS EXISTS. #137 was a 100%-CPU daemon, and on the two machines it was
+    investigated on, nobody could see inside the process. macOS needs root for
+    ``task_for_pid``, so py-spy is unavailable to any user not in sudoers --
+    which on a managed corporate Mac is the normal case, and was the case for
+    the author. The reporter on Ubuntu got py-spy attached and it was still
+    blind to the threads that mattered, so they fell back to ``gdb``. Between
+    them that is every standard tool defeated, for a defect whose entire
+    signature is "which thread is busy, doing what".
+
+    ``faulthandler`` needs no root, no attach, and no install: the process
+    dumps its own stacks on a signal it registered itself.
+
+    WHAT IT DOES NOT SHOW, said plainly: Python frames only. A native thread
+    with no Python frame -- a LanceDB tokio worker, for instance -- is
+    invisible here exactly as it was to py-spy. What it does show is which
+    Python thread is where, which is the question that went unanswered for
+    eleven days on the author's own machine.
+
+    Returns the dump path, or None where the platform has no SIGUSR1.
+    """
+    global _thread_dump_file
+    if not hasattr(signal, "SIGUSR1"):
+        return None
+    try:
+        import faulthandler
+
+        from superlocalmemory.infra.data_root import state_path
+
+        path = state_path("thread-dump.log")
+        # Held on a module global on purpose: faulthandler keeps the raw file
+        # descriptor, so a closed or garbage-collected handle turns the next
+        # signal into a crash instead of a diagnostic.
+        _thread_dump_file = open(path, "a", buffering=1)  # noqa: SIM115
+        faulthandler.register(
+            signal.SIGUSR1, file=_thread_dump_file,
+            all_threads=True, chain=False,
+        )
+        logger.info(
+            "thread dump armed: kill -USR1 %d  ->  %s", os.getpid(), path,
+        )
+        return path
+    except Exception:  # noqa: BLE001 -- a diagnostic must never block start
+        logger.debug("thread dump handler not installed", exc_info=True)
+        return None
+
+
 def start_server(port: int = _DEFAULT_PORT) -> None:
     """Start the unified daemon. Blocks until stopped."""
     global _start_time
+    install_thread_dump_signal()
     assert_no_durable_root_conflict()
     import socket
 

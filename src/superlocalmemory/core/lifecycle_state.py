@@ -108,11 +108,29 @@ def set_fact_lifecycle_zone(
 
 
 def reconcile_profile_lifecycle(db: Any, profile_id: str) -> int:
-    """Repair historical mirror drift using retention state as authority.
+    """Repair mirror drift using retention state as authority.
 
     Legacy archived atomic facts without a retention row are first imported as
     ``archive`` so they remain excluded from ordinary recall.  Existing
     retention rows then overwrite the compatibility mirror in one transaction.
+
+    THE DIRECTION IS DELIBERATE, AND WAS BRIEFLY INVERTED IN 4.1.15.
+
+    ``fact_retention`` is the authority: it holds the retention score, the
+    access timestamps, and the decay ladder that
+    ``POST /api/v3/forgetting/run`` writes. That route computes
+    ``lifecycle_zone`` from ``retention_score`` and then calls this function
+    for the express purpose of pushing the result into the mirror, so a
+    reconcile running the other way made the route discard its own work --
+    which ``test_run_forgetting_does_not_touch_archived`` caught.
+
+    The flapping in #136 -- 3,963 rows disagreeing on a live store, then 0
+    thirty-nine minutes later with no user activity -- was never caused by this
+    being bidirectional. It was caused by the Langevin backfill writing a
+    RANDOM ``lifecycle`` for every fact whose position was NULL, which this
+    function then faithfully propagated. The seed is deterministic now and the
+    backfill touches a fact once, so nothing is left oscillating for this to
+    carry. Fix the writer, not the mirror.
     """
     transaction = getattr(db, "transaction", None)
     txn_state = getattr(db, "_txn_state", None)

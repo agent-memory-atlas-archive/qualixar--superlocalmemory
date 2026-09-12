@@ -110,3 +110,39 @@ __all__ = [
     "authorize_mcp_mutation",
     "emit_event",
 ]
+
+
+def parse_id_list(raw: "str | list[str] | tuple[str, ...] | None") -> list[str]:
+    """Normalise the id-list argument an MCP client actually sent.
+
+    MCP tool signatures across this package declare list-shaped arguments as
+    ``str`` and split them on commas -- ``fact_ids``, ``memory_ids``,
+    ``changed_files``, ``languages``, ``exclude_patterns``. The server rejects
+    a real JSON array against a ``str`` annotation, so a client that holds a
+    list has to stringify it first, and the two shapes it produces are
+    ``'["a","b"]'`` (JSON) and ``"['a', 'b']"`` (Python repr). Both used to
+    split into one token that matched nothing. GitHub #135.
+
+    Accepts all four shapes. Never explodes a bare string into characters.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(item).strip() for item in raw if str(item).strip()]
+
+    text = str(raw).strip()
+    if not text:
+        return []
+
+    # A stringified array, JSON or Python repr. Strip the brackets and the
+    # quotes the client added, rather than guessing with a JSON parser that
+    # would reject the single-quoted repr form.
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+        return [
+            token.strip().strip("\"'").strip()
+            for token in text.split(",")
+            if token.strip().strip("\"'").strip()
+        ]
+
+    return [token.strip() for token in text.split(",") if token.strip()]
