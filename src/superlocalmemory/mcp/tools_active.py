@@ -28,6 +28,9 @@ from superlocalmemory.core.admission import admits
 from superlocalmemory.core.operation_request import OperationKind
 from superlocalmemory.infra.data_root import state_path
 from superlocalmemory.mcp.shared import authorize_mcp_mutation
+from superlocalmemory.storage.database import (
+    current_fact_clause_for_connection,
+)
 from superlocalmemory.storage.read_connection import ReadConnectionFactory
 
 if TYPE_CHECKING:
@@ -82,6 +85,7 @@ def _sqlite_emergency_recall(
                     WHERE fts.atomic_facts_fts MATCH ?
                       AND f.profile_id = ?
                       {age_clause}
+                      {current_fact_clause_for_connection(conn, "f")}
                     ORDER BY fts.rank
                     LIMIT ?""",
                 (safe_query, profile_id, limit * 2),
@@ -291,6 +295,7 @@ def _upcoming_scheduled_facts(engine, now: datetime.datetime) -> list[dict]:
             "   AND referenced_date IS NOT NULL"
             "   AND referenced_date >= ?"
             "   AND referenced_date < ?"
+            f"   {db.current_fact_clause()}"
             " ORDER BY referenced_date ASC"
             f" LIMIT {_SCHEDULED_LIMIT}",
             (engine.profile_id, start, end),
