@@ -77,11 +77,17 @@ def test_it_can_be_asked_more_than_once(armed) -> None:
 def test_arming_never_prevents_the_daemon_starting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A diagnostic that can block startup is worse than no diagnostic."""
-    monkeypatch.setenv("SLM_DATA_DIR", str(tmp_path / "does" / "not" / "exist"))
+    """A diagnostic that can block startup is worse than no diagnostic.
+
+    The failure is injected at ``faulthandler.register`` rather than by
+    monkeypatching ``builtins.open``. Replacing ``open`` globally inside an
+    11,000-test session breaks any unrelated machinery that reads a file while
+    the patch is live, which is a large blast radius for a small assertion.
+    """
+    monkeypatch.setenv("SLM_DATA_DIR", str(tmp_path))
 
     def _explode(*_args, **_kwargs):
-        raise OSError("no such directory")
+        raise OSError("cannot arm handler")
 
-    monkeypatch.setattr("builtins.open", _explode)
+    monkeypatch.setattr(faulthandler, "register", _explode)
     assert install_thread_dump_signal() is None
