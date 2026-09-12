@@ -118,6 +118,20 @@ class DrainResult:
         }
 
 
+def _should_keep_draining(handled: int, failed: int, batch: int) -> bool:
+    """Whether a drain pass earned another immediate pass.
+
+    A full batch used to be enough, counting failures as activity. A batch of
+    permanently failing rows satisfies that with ``handled == 0``, and the
+    outbox retires nothing on failure -- ``claim_batch`` has no WHERE and
+    ``record_failure`` only increments a counter -- so the same rows came back
+    every pass, forever, with no wait between them. GitHub #137.
+
+    Progress, not activity: at least one row must have cleared.
+    """
+    return handled > 0 and (handled + failed) >= batch
+
+
 class ProjectionDrain:
     """Applies queued facts to the graph and vector projections.
 
@@ -190,7 +204,9 @@ class ProjectionDrain:
                 # should drain continuously rather than one batch per tick.
                 while not self._stop.is_set():
                     result = self.drain_once()
-                    if result.handled + result.failed < DEFAULT_BATCH:
+                    if not _should_keep_draining(
+                        result.handled, result.failed, DEFAULT_BATCH,
+                    ):
                         break
             except Exception as exc:  # pragma: no cover - worker must not die
                 # A worker that exits on an unexpected error would leave the

@@ -6051,6 +6051,19 @@ def _ops_failure_counts(engine, application) -> dict:
     return result
 
 
+def _materializer_should_idle(
+    pending: object, durable_complete: int, durable_failed: int,
+) -> bool:
+    """Whether the materializer pass earned a sleep before the next one.
+
+    ``durable_failed`` used to suppress the sleep. The pass runs one operation
+    at a time, so a single operation that cannot succeed kept this loop at full
+    speed indefinitely, re-reaping and re-listing on every iteration. A failure
+    is activity, not progress. GitHub #137.
+    """
+    return not pending and not durable_complete
+
+
 def _reap_stuck_ingestion(db) -> list[str]:
     """Terminalize expired enrichment leases that exhausted retries.
 
@@ -6260,7 +6273,9 @@ def _start_pending_materializer() -> None:
                 # under whichever profile happens to be active now.
                 _active_profile = runtime.snapshot.profile_id
                 pending = get_pending(limit=50, profile_id=_active_profile)
-                if not pending and not durable_complete and not durable_failed:
+                if _materializer_should_idle(
+                    pending, durable_complete, durable_failed,
+                ):
                     time.sleep(1.0)
                     continue
                 if pending:

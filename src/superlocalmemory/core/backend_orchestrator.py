@@ -57,9 +57,26 @@ def get_orchestrator() -> BackendOrchestrator | None:
 
 
 def set_orchestrator(orch: BackendOrchestrator) -> None:
-    """Set the global BackendOrchestrator singleton."""
+    """Install the global BackendOrchestrator, retiring the previous one.
+
+    A plain assignment here leaked a whole native thread pool per call.
+    ``_hot_reconfigure_engine`` builds a fresh orchestrator on every
+    reconfigure and profile switch, and a LanceDB connection owns a Rust tokio
+    runtime sized to the host's cores -- so the old runtime, and the old drain
+    worker still writing into the projection that was just swapped out, both
+    stayed alive with no reference left to stop them. GitHub #137.
+
+    Retiring the predecessor must never prevent the successor being installed,
+    hence the guard: a half-installed orchestrator is worse than a leak.
+    """
     global _orchestrator
+    previous = _orchestrator
     _orchestrator = orch
+    if previous is not None and previous is not orch:
+        try:
+            previous.stop()
+        except Exception:
+            logger.warning("retiring the previous orchestrator failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -516,8 +533,28 @@ class BackendOrchestrator:
         return health
 
     def stop(self) -> None:
-        """Stop the drain worker. For daemon shutdown and for tests."""
-        self._drain.stop()
+        """Stop the drain worker and release the native backends.
+
+        Closing the backends is the part that was missing. ``close()`` on the
+        LanceDB backend existed and had no caller anywhere in ``src/``, so even
+        an orderly shutdown left its tokio runtime resident. Idempotent,
+        because shutdown races call this twice.
+        """
+        try:
+            self._drain.stop()
+        except Exception:
+            logger.debug("drain stop failed", exc_info=True)
+        for attr in ("_lancedb", "_cozo"):
+            backend = getattr(self, attr, None)
+            if backend is None:
+                continue
+            close = getattr(backend, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("%s close failed", attr, exc_info=True)
+            setattr(self, attr, None)
 
     # ------------------------------------------------------------------
     # Internal: Detection
