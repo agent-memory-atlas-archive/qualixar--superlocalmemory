@@ -106,3 +106,58 @@ class TestTheTickBoundsTheHistory:
     def test_the_window_is_tunable(self, monkeypatch) -> None:
         """An operator with a 17 GB store may want it shorter, once."""
         assert ms._VECTOR_HISTORY_DAYS == 7.0
+
+    def test_a_silent_skip_is_logged(self, monkeypatch, caplog) -> None:
+        monkeypatch.setattr(
+            "superlocalmemory.core.backend_orchestrator.get_orchestrator",
+            lambda: None,
+        )
+        with caplog.at_level("WARNING"):
+            ms.compact_vector_store()
+        assert "no orchestrator" in caplog.text
+
+    def test_startup_arms_compaction_without_waiting_the_interval(self) -> None:
+        import inspect
+        src = inspect.getsource(ms.MaintenanceScheduler.start)
+        assert "_initial_vector_compaction" in src
+
+
+class TestCompactDoesNotParseHistory:
+    def test_it_counts_manifests_on_disk(self, tmp_path) -> None:
+        from superlocalmemory.vector.lancedb_backend import LanceDBVectorBackend
+
+        class _Table:
+            def __init__(self) -> None:
+                self.list_calls = 0
+
+            def list_versions(self):
+                self.list_calls += 1
+                return list(range(50_580))
+
+            def optimize(self, **kwargs) -> None:
+                return None
+
+        versions = tmp_path / "embeddings.lance" / "_versions"
+        versions.mkdir(parents=True)
+        (versions / "1.manifest").write_text("x")
+        (versions / "2.manifest").write_text("x")
+        backend = LanceDBVectorBackend.__new__(LanceDBVectorBackend)
+        backend._table = _Table()
+        backend._db_path = str(tmp_path)
+        out = backend.compact()
+        assert out["ok"] is True
+        assert out["versions_before"] == 2
+        assert backend._table.list_calls == 0
+
+
+class TestOfflineCompactRefusesALiveWriter:
+    def test_it_exits_nonzero_when_the_daemon_is_alive(self, monkeypatch) -> None:
+        from argparse import Namespace
+
+        from superlocalmemory.cli import commands as cli_commands
+
+        monkeypatch.setattr(
+            "superlocalmemory.cli.daemon.owned_daemon_process_alive",
+            lambda: True,
+        )
+        assert cli_commands._cmd_db_compact(Namespace(offline=True)) == 1

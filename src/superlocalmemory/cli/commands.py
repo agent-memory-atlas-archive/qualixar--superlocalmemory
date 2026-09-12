@@ -94,13 +94,58 @@ def _cmd_db_dispatch(args: Namespace) -> None:
     if sub == "regraph":
         _cmd_db_regraph(args)
         return
+    if sub == "compact":
+        rc = _cmd_db_compact(args)
+        if rc:
+            sys.exit(rc)
+        return
     print(
         "Usage: slm db migrate [--status] [--dry-run] "
         "| slm db scale <action> "
         "| slm db regraph [--check] [--profile NAME] "
-        "| slm db reembed [--missing-only] [--all-profiles] [--limit N]"
+        "| slm db reembed [--missing-only] [--all-profiles] [--limit N] "
+        "| slm db compact [--offline]"
     )
     sys.exit(2)
+
+
+def _cmd_db_compact(args: Namespace) -> int:
+    """Drop old LanceDB vector-store versions.
+
+    The live path goes through the daemon's orchestrator and never sets
+    delete_unverified — those files belong to in-flight writes. --offline
+    refuses to run while the daemon is alive and then may delete them.
+    """
+    from datetime import timedelta
+
+    from superlocalmemory.cli.daemon import owned_daemon_process_alive
+    from superlocalmemory.core.maintenance_scheduler import compact_vector_store
+    from superlocalmemory.infra.data_root import canonical_data_root
+
+    offline = bool(getattr(args, "offline", False))
+    if not offline:
+        out = compact_vector_store()
+        print(out)
+        return 0 if out.get("ok") else 1
+
+    if owned_daemon_process_alive():
+        print(
+            "slm db compact --offline: daemon is running. "
+            "Stop it first (`slm serve stop` / unload the LaunchAgent).",
+            file=sys.stderr,
+        )
+        return 1
+
+    lance = canonical_data_root() / "lance"
+    from superlocalmemory.vector.lancedb_backend import LanceDBVectorBackend
+
+    backend = LanceDBVectorBackend(str(lance))
+    try:
+        out = backend.compact(retention=timedelta(0), delete_unverified=True)
+    finally:
+        backend.close()
+    print(out)
+    return 0 if out.get("ok") else 1
 
 
 def _cmd_db_regraph(args: Namespace) -> None:

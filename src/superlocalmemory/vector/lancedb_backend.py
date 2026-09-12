@@ -160,10 +160,7 @@ class LanceDBVectorBackend:
         table = self._table
         if table is None:
             return {"ok": False, "reason": "no table"}
-        try:
-            before = len(table.list_versions())
-        except Exception:
-            before = -1
+        before = self._manifest_count()
         try:
             table.optimize(
                 cleanup_older_than=retention,
@@ -172,15 +169,25 @@ class LanceDBVectorBackend:
         except Exception as exc:  # noqa: BLE001 -- maintenance is best-effort
             logger.warning("vector store compaction failed: %s", exc)
             return {"ok": False, "reason": str(exc), "versions_before": before}
-        try:
-            after = len(table.list_versions())
-        except Exception:
-            after = -1
+        after = self._manifest_count()
         if before > 0 and after > 0:
             logger.info(
                 "vector store compacted: %d versions -> %d", before, after,
             )
         return {"ok": True, "versions_before": before, "versions_after": after}
+
+    def _manifest_count(self) -> int:
+        """Count on-disk version manifests. Never parses them.
+
+        ``list_versions()`` reads every manifest. On a leaked store each
+        manifest lists tens of thousands of fragments and is ~1.3 MB, so a
+        37k-version store is ~48 GB of I/O before prune even starts.
+        """
+        try:
+            root = Path(self._db_path) / "embeddings.lance" / "_versions"
+            return sum(1 for p in root.glob("*.manifest") if p.is_file())
+        except Exception:  # pragma: no cover — filesystem count is best-effort
+            return -1
 
     def close(self) -> None:
         """Release this backend's native table and connection references."""

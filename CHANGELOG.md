@@ -5,6 +5,41 @@ All notable changes to SuperLocalMemory will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.17] — Vector history that actually gets pruned
+
+### Fixed
+
+- **The vector store's version history now prunes after a restart.** 4.1.16
+  added a maintenance tick that drops old LanceDB versions, but the first tick
+  was armed from boot and only re-armed when that pass finished. A LaunchAgent
+  with KeepAlive that restarts inside `scheduler_interval_minutes` (360 by
+  default) never got a first pass. Measured on one machine: 3,517 scheduler
+  starts, zero compact log lines, 37,040 versions, a 48 GB `_versions/`
+  directory for 19,701 memories. A one-shot ~270s after boot now runs the same
+  prune, records the outcome in `failing_steps()`, and the periodic tick
+  compacts the one global table once — before the per-profile Langevin/Ollama
+  work that previously ran for 11+ minutes and never reached it. This is the
+  rest of GitHub #137.
+- **`compact()` no longer parses every version to count them.** `list_versions()`
+  reads each manifest. On the leaked store each manifest listed tens of
+  thousands of fragments and was ~1.3 MB, so counting was ~48 GB of I/O before
+  prune started. Counts now come from the `*.manifest` files on disk.
+- **`POST /maintenance/run` actually compacts the vector store.** It ran
+  Langevin, forgetting, and behavioral mining only. Operators who "ran
+  maintenance" were not reclaiming disk. The JSON now includes `vector`.
+- **A skipped compact is no longer silent.** `no orchestrator` and `backend
+  cannot compact` now log a warning, so "never ran" and "ran and failed" are
+  distinguishable.
+
+### Added
+
+- **`slm db compact [--offline]`.** The live path uses the daemon and never
+  sets `delete_unverified`. `--offline` refuses to run while the daemon is
+  alive, then may. That is the supported repair for a store that already
+  leaked. On the same machine, offline `optimize(cleanup_older_than=0,
+  delete_unverified=True)` with the LaunchAgent unloaded went 37,040 manifests
+  / 48 GB → 1 manifest / 51 MB in 430s, row count unchanged.
+
 ## [4.1.16] — A memory's tier finally means something
 
 ### Fixed

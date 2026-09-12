@@ -391,6 +391,16 @@ def main() -> None:
         help="Output structured JSON",
     )
 
+    db_compact_p = db_sub.add_parser(
+        "compact",
+        help="Drop old LanceDB vector-store versions",
+    )
+    db_compact_p.add_argument(
+        "--offline",
+        action="store_true",
+        help="Daemon must be stopped. Allows delete_unverified. Use for a leaked store.",
+    )
+
     # -- Mesh inspection (v3.7.9, M-03) --------------------------------
     mesh_p = sub.add_parser("mesh", help="Inspect the local agent mesh (status/peers)")
     mesh_p.add_argument(

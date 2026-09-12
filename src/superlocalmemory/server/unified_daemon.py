@@ -5291,6 +5291,14 @@ def _register_daemon_routes(application: FastAPI) -> None:
             except Exception:
                 logger.exception("maintenance behavioral step failed")
                 results["behavioral"] = {"error": "internal error"}
+            try:
+                from superlocalmemory.core.maintenance_scheduler import (
+                    compact_vector_store,
+                )
+                results["vector"] = compact_vector_store()
+            except Exception:
+                logger.exception("maintenance vector compaction failed")
+                results["vector"] = {"ok": False, "error": "internal error"}
             authorization.complete()
             return {"ok": True, "profile": pid, **results}
         except HTTPException:
