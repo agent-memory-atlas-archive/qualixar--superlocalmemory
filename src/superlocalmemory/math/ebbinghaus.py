@@ -98,6 +98,12 @@ _ZONE_WEIGHTS: dict[str, float] = {
 # EbbinghausCurve
 # ---------------------------------------------------------------------------
 
+#: Retention a baseline memory has after ``ARCHIVE_AFTER_DAYS`` of neglect.
+#: Anchors the decay CLOCK. Deliberately a constant rather than
+#: ``ForgettingConfig.archive_threshold`` — see ``store_scaled_strength``.
+_ARCHIVE_REFERENCE_RETENTION: float = 0.2
+
+
 class EbbinghausCurve:
     """Ebbinghaus forgetting curve with configurable strength formula.
 
@@ -170,7 +176,14 @@ class EbbinghausCurve:
             access_count=0, importance=0.5,
             confirmation_count=0, emotional_salience=0.0,
         )
-        decades = -math.log(max(cfg.archive_threshold, 1e-6))
+        # The reference retention is FIXED, not read from config. Deriving the
+        # clock from the configured ``archive_threshold`` would mean a caller
+        # tightening a CLASSIFICATION boundary silently rescaled TIME: a test
+        # setting ``archive_threshold=0.999`` to force quick forgetting got
+        # ``-log(0.999)`` and a thousand-year time constant, i.e. the exact
+        # opposite of what it asked for. Thresholds decide which band a
+        # retention lands in; they do not decide how fast retention falls.
+        decades = -math.log(_ARCHIVE_REFERENCE_RETENTION)
         baseline_hours = (ARCHIVE_AFTER_DAYS * 24.0) / decades
         scaled = baseline_hours * (
             max(strength, cfg.min_strength) / max(baseline, 1e-6)

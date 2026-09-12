@@ -5,6 +5,36 @@ All notable changes to SuperLocalMemory will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.16] — A memory's tier finally means something
+
+### Fixed
+
+- **Forgetting is measured on the store's clock.** The decay curve models
+  working memory — its strongest setting is about four days — but it was fed
+  real elapsed time from a store that keeps memories for years. Anything older
+  than a few days scored as fully forgotten: on one store, **5,546 of 5,561
+  memories**, which the rest of the system read as archived, so every feature
+  that shows only active memories showed almost nothing. A memory is now still
+  fully available after a month and only reaches the archive threshold after a
+  year, with use pulling it back. (#136)
+- **Archived and forgotten are no longer one-way.** A memory being used again
+  could never climb back out of either, so a mis-scored memory stayed wrong
+  forever even after the scoring was corrected. Demotion stays one-way;
+  promotion no longer is.
+- **A recomputed tier is no longer discarded on the same cycle.** 4.1.15 wrote
+  the recomputed tier to the mirrored column rather than the authoritative one,
+  so the reconcile step later in the same cycle replaced it with the old value
+  — the corrected tiers appeared and were gone again within one cycle. All four
+  places that write a tier now write both, and a check fails the build if a new
+  one writes only the mirror.
+
+### Note
+
+4.1.15 fixed how a memory's tier is *decided* but not how it is *stored* or how
+it *decays*, so on an existing store the correction undid itself within
+minutes. 4.1.16 completes it. Measured on a real 5,561-memory store: active
+went from 9 to 5,381 and held through a full maintenance cycle.
+
 ## [4.1.15] — Retrieval-honesty release
 
 ### Fixed
